@@ -333,7 +333,8 @@ def main():
         col1, col2 = st.columns([1, 1])
         
         with col1:
-            st.image(img_input, caption="Gambar Input (Upload/Kamera)", use_column_width=True)
+            # PERBAIKAN: gunakan use_container_width, BUKAN use_column_width
+            st.image(img_input, caption="Gambar Input (Upload/Kamera)", use_container_width=True)
         
         with col2:
             with st.spinner("Sedang memproses deteksi dan ekstraksi... Mohon tunggu."):
@@ -350,7 +351,8 @@ def main():
                     # Tampilkan ROI (Area yang dideteksi YOLO)
                     if result['roi_img'] is not None:
                         roi_rgb = cv2.cvtColor(result['roi_img'], cv2.COLOR_BGR2RGB)
-                        st.image(roi_rgb, caption="Area Tabel Gizi (ROI)", use_column_width=True)
+                        # PERBAIKAN: gunakan use_container_width di sini juga
+                        st.image(roi_rgb, caption="Area Tabel Gizi (ROI)", use_container_width=True)
                     
                     # Tampilkan Hasil Raw OCR
                     with st.expander("🔍 Lihat Hasil OCR Mentah (Sebelum Fuzzy)"):
