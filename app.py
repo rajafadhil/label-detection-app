@@ -351,7 +351,10 @@ def main():
                     # Tampilkan ROI (Area yang dideteksi YOLO)
                     if result['roi_img'] is not None:
                         roi_rgb = cv2.cvtColor(result['roi_img'], cv2.COLOR_BGR2RGB)
-                        # PERBAIKAN: gunakan use_container_width di sini juga
+                        # Menampilkan Confidence Score
+                        st.markdown(f"#### 🎯 Confidence Score Deteksi YOLOv11: **{result['det_conf']:.2%}**")
+                        
+                        # Tampilkan gambar ROI
                         st.image(roi_rgb, caption="Area Tabel Gizi (ROI)", use_container_width=True)
                     
                     # Tampilkan Hasil Raw OCR
@@ -364,7 +367,6 @@ def main():
                     if result['nutrients']:
                         data_display = []
                         for key, val in sorted(result['nutrients'].items()):
-                            # Mapping kunci internal ke nama tampil yang bagus
                             display_name = key.replace('_', ' ').title()
                             data_display.append({
                                 "Nutrisi": display_name,
