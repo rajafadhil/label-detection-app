@@ -13,7 +13,7 @@ from rapidfuzz import fuzz, process
 from Levenshtein import distance as levenshtein_distance
 
 # --- KONFIGURASI AWAL ---
-st.set_page_config(page_title="Deteksi Label Gizi BPOM", layout="wide", page_icon="🥤")
+st.set_page_config(page_title="BPOM Nutrition Label Detection", layout="wide", page_icon="🥤")
 
 # Konfigurasi Path & Model (Pastikan file best.pt ada di folder yang sama)
 MODEL_PATH = 'best.pt' 
