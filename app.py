@@ -296,35 +296,35 @@ def run_pipeline_api_paddle(img_input, model):
 # --- UI STREAMLIT ---
 
 def main():
-    st.title("🥤 Deteksi Label Gizi Minuman (YOLOv11 + PaddleOCR)")
+    st.title("🥤 Beverage Nutrition Label Detection (YOLOv11 + PaddleOCR)")
     st.markdown("""
-    Aplikasi ini mendeteksi tabel informasi nilai gizi pada kemasan minuman, 
-    mengekstrak teks menggunakan OCR, dan memperbaiki hasil ekstraksi menggunakan 
-    **Fuzzy Matching** berdasarkan standar **BPOM**.
+    This app detects nutrition facts tables on beverage packaging,
+    extracts text using OCR, and refines the extracted results using
+    **Fuzzy Matching** based on **BPOM** standards.
     """)
 
     # Load Model
-    with st.spinner("Memuat Model YOLOv11..."):
+    with st.spinner("Loading the YOLOv11 model..."):
         model = load_model()
     
     if model is None:
         st.stop()
 
     # --- BAGIAN INPUT GAMBAR / KAMERA ---
-    st.subheader("1. Masukkan Gambar Kemasan")
+    st.subheader("1. Upload Packaging Image")
     
     # Buat tab untuk memisahkan opsi Upload dan Kamera
-    tab_upload, tab_kamera = st.tabs(["📁 Upload Gambar", "📷 Ambil Foto Langsung"])
+    tab_upload, tab_kamera = st.tabs(["📁 Upload Image", "📷 Take a Photo Right Away"])
 
     img_input = None
 
     with tab_upload:
-        uploaded_file = st.file_uploader("Unggah gambar dari perangkat Anda", type=["jpg", "jpeg", "png"])
+        uploaded_file = st.file_uploader("Upload an image from your device", type=["jpg", "jpeg", "png"])
         if uploaded_file is not None:
             img_input = uploaded_file
 
     with tab_kamera:
-        camera_file = st.camera_input("Posisikan label informasi nilai gizi di tengah layar, lalu klik tombol kamera.")
+        camera_file = st.camera_input("Center the nutrition facts label on the screen, then click the camera button.")
         if camera_file is not None:
             img_input = camera_file
 
@@ -334,35 +334,35 @@ def main():
         
         with col1:
             # PERBAIKAN: gunakan use_container_width, BUKAN use_column_width
-            st.image(img_input, caption="Gambar Input (Upload/Kamera)", use_container_width=True)
+            st.image(img_input, caption="Input Image (Upload/Camera)", use_container_width=True)
         
         with col2:
-            with st.spinner("Sedang memproses deteksi dan ekstraksi... Mohon tunggu."):
+            with st.spinner("Detection and extraction in progress... Please wait."):
                 # Proses Pipeline
                 start_time = time.time()
                 result = run_pipeline_api_paddle(img_input, model)
                 elapsed_time = time.time() - start_time
                 
                 if result['error']:
-                    st.error(f"❌ Terjadi Kesalahan: {result['error']}")
+                    st.error(f"❌ An Error Occurred: {result['error']}")
                 else:
-                    st.success(f"✅ Berhasil diproses dalam {elapsed_time:.2f} detik!")
+                    st.success(f"✅ Successfully processed in {elapsed_time:.2f} second!")
                     
                     # Tampilkan ROI (Area yang dideteksi YOLO)
                     if result['roi_img'] is not None:
                         roi_rgb = cv2.cvtColor(result['roi_img'], cv2.COLOR_BGR2RGB)
                         # Menampilkan Confidence Score
-                        st.markdown(f"#### 🎯 Confidence Score Deteksi YOLOv11: **{result['det_conf']:.2%}**")
+                        st.markdown(f"#### 🎯 YOLOv11 Detection Confidence Score: **{result['det_conf']:.2%}**")
                         
                         # Tampilkan gambar ROI
-                        st.image(roi_rgb, caption="Area Tabel Gizi (ROI)", use_container_width=True)
+                        st.image(roi_rgb, caption="Nutritional Table Area (ROI)", use_container_width=True)
                     
                     # Tampilkan Hasil Raw OCR
-                    with st.expander("🔍 Lihat Hasil OCR Mentah (Sebelum Fuzzy)"):
+                    with st.expander("🔍 View Raw OCR Results (Before Fuzzy Processing)"):
                         st.text_area("Raw Text", result['raw_text'], height=150)
                     
                     # Tampilkan Hasil Akhir (Setelah Fuzzy)
-                    st.subheader("📊 Hasil Ekstraksi Nilai Gizi (Validasi BPOM)")
+                    st.subheader("📊 Nutritional Value Analysis Results (BPOM Validation)")
                     
                     if result['nutrients']:
                         data_display = []
@@ -377,7 +377,7 @@ def main():
                         df_result = pd.DataFrame(data_display)
                         st.table(df_result)
                     else:
-                        st.warning("Tidak ada nutrisi valid yang terdeteksi setelah proses Fuzzy Matching.")
+                        st.warning("No valid nutrients were detected after the Fuzzy Matching process.")
 
 if __name__ == "__main__":
     main()
