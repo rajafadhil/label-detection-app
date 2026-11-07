@@ -1,6 +1,7 @@
 streamlit
 ultralytics
 opencv-python-headless
+pywavelets
 rapidfuzz
 Levenshtein
 requests
