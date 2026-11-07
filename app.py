@@ -1,383 +1,359 @@
-import streamlit as st
+"""
+Streamlit App: Beverage Nutrition Label Detection and Extraction
+Pipeline: Image -> YOLOv11n -> ROI -> PaddleOCR (API) -> BPOM Validation (fuzzy) -> Structured nutrition data
+
+Accompanying files that MUST be in the same folder as app.py:
+  - best.pt                 (YOLO weights - Make sure this is the 'no prep' version)
+  - preprocess.py           (same module as YOLO notebook)
+  - nutrition_postproc.py   (same module as OCR notebook)
+"""
+import json
+import os
+import time
+
 import cv2
 import numpy as np
-import re
-import time
-import json
-import requests
-import tempfile
-import os
 import pandas as pd
+import requests
+import streamlit as st
 from ultralytics import YOLO
-from rapidfuzz import fuzz, process
-from Levenshtein import distance as levenshtein_distance
 
-# --- KONFIGURASI AWAL ---
-st.set_page_config(page_title="BPOM Nutrition Label Detection", layout="wide", page_icon="🥤")
+from preprocess import preprocess_image
+import nutrition_postproc as npp
 
-# Konfigurasi Path & Model (Pastikan file best.pt ada di folder yang sama)
-MODEL_PATH = 'best.pt' 
-PADDLE_API_TOKEN = st.secrets.get("PADDLE_OCR_TOKEN", None) # Gunakan Secrets Streamlit untuk keamanan
+# ============================================================ CONFIGURATION
+MODEL_PATH = "best.pt"
+IMGSZ = 640
+DET_CONF = 0.537                 # same as CONF_EVAL / DET_CONF in notebook
+FUZZY_THRESHOLD = 60             # sensitivity analysis result (highest F1, precision > threshold 50)
+LINE_TOL_MODE = "fixed"          # 'fixed' (10 px) | 'adaptive'
+LINE_TOL_FIXED_PX = 10
 
-if not PADDLE_API_TOKEN:
-    st.error("⚠️ Token PaddleOCR API tidak ditemukan. Pastikan Anda menambahkan token di Settings > Secrets.")
-    st.stop()
+# Preprocessing disabled (No Prep)
+PREPROCESS_BEFORE_DETECTION = False  # Only resize, no CLAHE+Haar
+PREPROCESS_ROI_BEFORE_OCR = False    # Raw ROI (no prep) directly to OCR
 
 JOB_URL = "https://paddleocr.aistudio-app.com/api/v2/ocr/jobs"
-MODEL_VERSION = "PP-OCRv6" 
-
-HEADERS = {
-    "Authorization": f"bearer {PADDLE_API_TOKEN}"
-}
-
+MODEL_VERSION = "PP-OCRv6"
 OPTIONAL_PAYLOAD = {
     "useDocOrientationClassify": False,
     "useDocUnwarping": False,
     "useTextlineOrientation": False,
 }
+API_MAX_RETRIES = 3
+API_POLL_INTERVAL = 2.0
+API_TIMEOUT_S = 150
 
-# --- KAMUS BPOM & FUZZY MATCHING ---
-BPOM_NUTRIENT_DICTIONARY = {
-    'energi': ['energi', 'energy', 'tenaga', 'kalori', 'calories', 'kcal', 'kkal'],
-    'lemak_total': ['lemak total', 'total fat', 'lipid', 'total lemak'],
-    'lemak_jenuh': ['lemak jenuh', 'saturated fat', 'lemak sat', 'sat fat'],
-    'protein': ['protein', 'proteine'],
-    'karbohidrat_total': ['karbohidrat total', 'total carbohydrate', 'carbs', 'kohlenhydrate'],
-    'gula': ['gula', 'sugars', 'zucker', 'sucre'],
-    'natrium': ['natrium', 'sodium', 'garam', 'salt']
+# Keep the keys as Indonesian to match BPOM module logic, but change display values to English
+DISPLAY_NAMES = {
+    "energi": "Energy",
+    "lemak_total": "Total Fat",
+    "lemak_jenuh": "Saturated Fat",
+    "protein": "Protein",
+    "karbohidrat_total": "Total Carbohydrate",
+    "gula": "Sugar",
+    "natrium": "Sodium",
 }
 
-NUTRIENT_UNITS = {
-    'energi': 'kkal', 'lemak_total': 'g', 'lemak_jenuh': 'g',
-    'protein': 'g', 'karbohidrat_total': 'g', 'gula': 'g', 'natrium': 'mg'
-}
+st.set_page_config(page_title="BPOM Nutrition Label Detection", layout="wide", page_icon="🥤")
 
-MIN_TERM_LENGTH = 3
 
-all_variations = []
-mapping = {}
-for cat, vars in BPOM_NUTRIENT_DICTIONARY.items():
-    for v in vars:
-        if len(v) < MIN_TERM_LENGTH:
-            continue
-        all_variations.append(v)
-        mapping[v] = cat
+# ============================================================ TOKEN & MODEL
+def get_token():
+    try:
+        return st.secrets["PADDLE_OCR_TOKEN"]
+    except Exception:
+        return os.environ.get("PADDLE_OCR_TOKEN")
 
-# --- FUNGSI BANTUAN ---
 
-@st.cache_resource
+@st.cache_resource(show_spinner=False)
 def load_model():
-    """Memuat model YOLOv11 sekali saja saat aplikasi dimulai"""
-    try:
-        return YOLO(MODEL_PATH)
-    except Exception as e:
-        st.error(f"Gagal memuat model YOLO: {e}")
-        return None
+    model = YOLO(MODEL_PATH)
+    # warm-up so first inference is not distorted
+    model.predict(np.zeros((640, 480, 3), np.uint8), imgsz=IMGSZ, verbose=False)
+    return model
 
-def clean_ocr_text(text):
-    """Membersihkan teks dari karakter noise"""
-    text = re.sub(r'[^a-zA-Z0-9\s.,%/-]', '', text)
-    text = re.sub(r'\s+', ' ', text).strip()
-    return text.lower()
 
-def extract_numeric_value_robust(text, expected_unit=''):
-    """Ekstraksi nilai numerik yang robust"""
-    text_clean = text.strip().replace(',', '.')
-    text_clean = re.sub(r'(\d)O(\d)', r'\g<1>0\2', text_clean, flags=re.IGNORECASE)
-    text_clean = re.sub(r'(\d)l(\d)', r'\g<1>1\2', text_clean, flags=re.IGNORECASE)
+# ============================================================ PREPROCESS & DETECTION
+def resize_long_side(img, target=IMGSZ):
+    """Same as training pool: longest side = 640, not upscaled."""
+    h, w = img.shape[:2]
+    s = target / max(h, w)
+    if s >= 1:
+        return img
+    return cv2.resize(img, (round(w * s), round(h * s)), interpolation=cv2.INTER_AREA)
 
-    pattern = r'(\d+\.?\d*)\s*(g|mg|kkal|kcal|%)?'
-    match = re.search(pattern, text_clean, re.IGNORECASE)
 
-    if match:
-        val_str = match.group(1)
-        unit = (match.group(2) or '').lower()
+def detect_roi(img_raw, model):
+    """Return (det | None, t_pre_ms, t_det_ms). Box rescaled to original resolution."""
+    H, W = img_raw.shape[:2]
+
+    t = time.perf_counter()
+    small = resize_long_side(img_raw)
+    x_in = preprocess_image(small) if PREPROCESS_BEFORE_DETECTION else small
+    t_pre = (time.perf_counter() - t) * 1000
+
+    t = time.perf_counter()
+    r = model.predict(x_in, conf=DET_CONF, imgsz=IMGSZ, verbose=False)[0]
+    t_det = (time.perf_counter() - t) * 1000
+
+    if len(r.boxes) == 0:
+        return None, t_pre, t_det
+
+    i = int(r.boxes.conf.argmax())  # highest confidence detection
+    x1, y1, x2, y2 = r.boxes.xyxy[i].cpu().numpy()
+    sh, sw = small.shape[:2]
+    sx, sy = W / sw, H / sh
+    box = [max(0, int(x1 * sx)), max(0, int(y1 * sy)),
+           min(W, int(x2 * sx)), min(H, int(y2 * sy))]
+    return dict(bbox=box, conf=float(r.boxes.conf[i])), t_pre, t_det
+
+
+# ============================================================ PADDLEOCR API
+def parse_ocr_jsonl(jsonl_text):
+    out = []
+    for line in jsonl_text.strip().split("\n"):
+        if not line.strip():
+            continue
         try:
-            val = float(val_str)
-            final_unit = unit if unit else expected_unit
-            # Koreksi sederhana jika satuan tidak sesuai ekspektasi (opsional)
-            if expected_unit == 'g' and val > 100: 
-                val = val / 10
-            return val, final_unit
-        except ValueError:
-            pass
-
-    numbers = re.findall(r'\d+\.?\d*', text_clean)
-    if numbers:
-        try:
-            return float(numbers[0]), expected_unit
-        except ValueError:
-            pass
-
-    return None, None
-
-def process_fuzzy_matching(ocr_data):
-    """Memproses data OCR mentah menjadi struktur nutrisi menggunakan Fuzzy Matching"""
-    if not ocr_data:
-        return "", {}
-
-    raw_text = " ".join([d['text'] for d in ocr_data])
-
-    # 1. Grouping Spasial (Berdasarkan Y-Center)
-    tolerance = 10 
-    items_sorted = sorted(ocr_data, key=lambda i: i['y_center'])
-    sorted_lines = []
-    current_group, current_y = [], None
-    for item in items_sorted:
-        if current_y is None or abs(item['y_center'] - current_y) <= tolerance:
-            current_group.append(item)
-            current_y = sum(i['y_center'] for i in current_group) / len(current_group)
-        else:
-            sorted_lines.append((current_y, current_group))
-            current_group, current_y = [item], item['y_center']
-    if current_group:
-        sorted_lines.append((current_y, current_group))
-    
-    all_candidates = {}
-
-    # 2. Fuzzy Matching per Baris
-    for y_pos, items in sorted_lines:
-        items.sort(key=lambda i: float(np.mean(np.array(i['box'])[:, 0])) if len(i['box']) > 0 else 0)
-        line_text = " ".join([i['text'] for i in items])
-        line_text_clean = clean_ocr_text(line_text)
-
-        if not line_text_clean: continue
-
-        match = process.extractOne(line_text_clean, all_variations, scorer=fuzz.partial_ratio)
-        if match:
-            best_match_term, score, idx = match
-            if score >= 65: # Threshold similarity
-                found_cat = mapping[best_match_term]
-                expected_unit = NUTRIENT_UNITS.get(found_cat, '')
-                val, unit = extract_numeric_value_robust(line_text, expected_unit)
-
-                if val is not None:
-                    # Ambil nilai terbaik jika ada duplikasi kategori
-                    if found_cat not in all_candidates or score > all_candidates[found_cat]['score']:
-                        all_candidates[found_cat] = {
-                            'value': val, 'unit': unit if unit else expected_unit,
-                            'orig': line_text.strip(), 'score': score
-                        }
-
-    corrected = {k: v for k, v in all_candidates.items()}
-    # Hapus score dari output akhir agar rapi
-    for k in corrected: 
-        if 'score' in corrected[k]: del corrected[k]['score']
-
-    return raw_text, corrected
-
-def run_pipeline_api_paddle(img_input, model):
-    """Pipeline End-to-End: Streamlit Input -> YOLOv11 -> Crop -> PaddleOCR API -> Fuzzy"""
-    result = {'det_conf': 0, 'raw_text': '', 'nutrients': {}, 'error': None, 'roi_img': None}
-
-    # 1. Baca file dari Streamlit UploadedFile ke OpenCV format
-    file_bytes = np.asarray(bytearray(img_input.read()), dtype=np.uint8)
-    img_cv = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
-    
-    if img_cv is None:
-        result['error'] = 'Gagal membaca/mendekode gambar'
-        return result
-
-    # 2. Deteksi YOLOv11
-    results = model.predict(img_cv, conf=0.5, verbose=False)
-    if len(results[0].boxes) == 0:
-        result['error'] = 'No ROI detected (Label tidak terdeteksi)'
-        return result
-
-    box = results[0].boxes.xyxy[0].cpu().numpy()
-    result['det_conf'] = float(results[0].boxes.conf[0].cpu().numpy())
-    x1, y1, x2, y2 = map(int, box)
-    
-    # Validasi koordinat
-    h, w = img_cv.shape[:2]
-    x1, y1 = max(0, x1), max(0, y1)
-    x2, y2 = min(w, x2), min(h, y2)
-    
-    roi = img_cv[y1:y2, x1:x2]
-    result['roi_img'] = roi # Simpan untuk visualisasi
-
-    # 3. Simpan ROI ke temporary file untuk dikirim ke API
-    with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp_file:
-        cv2.imwrite(tmp_file.name, roi)
-        temp_img_path = tmp_file.name
-
-    try:
-        # 4. Submit Job ke PaddleOCR API
-        data = {"model": MODEL_VERSION, "optionalPayload": json.dumps(OPTIONAL_PAYLOAD)}
-        with open(temp_img_path, "rb") as f:
-            job_response = requests.post(JOB_URL, headers=HEADERS, data=data, files={"file": f})
-
-        if job_response.status_code != 200:
-            result['error'] = f"API Submit Failed: {job_response.text}"
-            return result
-
-        job_id = job_response.json()["data"]["jobId"]
-
-        # 5. Polling hingga job selesai
-        jsonl_url = ""
-        max_retries = 15
-        for _ in range(max_retries):
-            time.sleep(2) # Wait 2 seconds per retry
-            job_result_response = requests.get(f"{JOB_URL}/{job_id}", headers=HEADERS)
-            if job_result_response.status_code != 200: break
-
-            state = job_result_response.json()["data"]["state"]
-            if state == 'done':
-                jsonl_url = job_result_response.json()['data']['resultUrl']['jsonUrl']
-                break
-            elif state == "failed":
-                result['error'] = f"API Job Failed"
-                break
-
-        if not jsonl_url:
-            result['error'] = 'API Timeout or Failed'
-            return result
-
-        # 6. Parse Hasil JSONL
-        jsonl_response = requests.get(jsonl_url)
-        jsonl_response.raise_for_status()
-        lines = jsonl_response.text.strip().split('\n')
-
-        ocr_data = []
-        for line in lines:
-            if not line.strip(): continue
-            try:
-                data_json = json.loads(line)
-            except json.JSONDecodeError:
+            d = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        res = d.get("result", {})
+        pages = res.get("ocrResults", []) if isinstance(res, dict) else (res if isinstance(res, list) else [])
+        for page in pages:
+            if not isinstance(page, dict):
                 continue
+            pr = page.get("prunedResult", page)
+            texts = pr.get("rec_texts") or []
+            scores = pr.get("rec_scores") or []
+            polys = pr.get("rec_polys") or pr.get("dt_polys") or []
+            boxes = pr.get("rec_boxes") or []
+            for i, t in enumerate(texts):
+                if not t:
+                    continue
+                poly = polys[i] if i < len(polys) else None
+                if poly is None and i < len(boxes):
+                    x1, y1, x2, y2 = boxes[i]
+                    poly = [[x1, y1], [x2, y1], [x2, y2], [x1, y2]]
+                arr = np.array(poly if poly is not None else [], dtype=float)
+                ok = arr.ndim == 2 and arr.shape[1] >= 2 and len(arr) > 0
+                out.append(dict(
+                    text=str(t),
+                    score=float(scores[i]) if i < len(scores) else 0.0,
+                    y_center=float(arr[:, 1].mean()) if ok else 0.0,
+                    box=arr.tolist() if ok else [],
+                ))
+    return out
 
-            page_results = data_json.get("result", {}).get("ocrResults", [])
-            if not page_results and isinstance(data_json.get("result"), list):
-                page_results = data_json["result"]
 
-            for page in page_results:
-                if not isinstance(page, dict): continue
+def call_paddle_api(img_bgr, token):
+    """Return dict(ocr_data, error, ms, attempts). ms includes submit + polling + download (including retries)."""
+    headers = {"Authorization": f"bearer {token}"}
+    ok, buf = cv2.imencode(".jpg", img_bgr, [cv2.IMWRITE_JPEG_QUALITY, 95])
+    if not ok:
+        return dict(ocr_data=[], error="Encoding failed", ms=0.0, attempts=0)
 
-                pruned = page.get("prunedResult", page)
-                rec_texts = pruned.get("rec_texts")
+    payload = {"model": MODEL_VERSION, "optionalPayload": json.dumps(OPTIONAL_PAYLOAD)}
+    t0, err = time.perf_counter(), None
 
-                if rec_texts:
-                    rec_scores = pruned.get("rec_scores", [0.0] * len(rec_texts))
-                    rec_polys = pruned.get("rec_polys", pruned.get("dt_polys", []))
-                    rec_boxes = pruned.get("rec_boxes", [])
-                    
-                    for i, text in enumerate(rec_texts):
-                        if not text: continue
-                        score = rec_scores[i] if i < len(rec_scores) else 0.0
-                        poly = rec_polys[i] if i < len(rec_polys) else None
-                        
-                        if not poly and i < len(rec_boxes):
-                            x1b, y1b, x2b, y2b = rec_boxes[i]
-                            poly = [[x1b, y1b], [x2b, y1b], [x2b, y2b], [x1b, y2b]]
-                        
-                        poly = poly or []
-                        try:
-                            poly_np = np.array(poly)
-                            y_center = float(np.mean(poly_np[:, 1])) if poly_np.ndim == 2 and poly_np.shape[1] >= 2 else 0.0
-                        except Exception:
-                            y_center = 0.0
-                            
-                        ocr_data.append({'text': str(text), 'score': float(score) if score else 0.0, 'y_center': y_center, 'box': poly})
+    for attempt in range(1, API_MAX_RETRIES + 1):
+        try:
+            r = requests.post(JOB_URL, headers=headers, data=payload, timeout=60,
+                              files={"file": ("roi.jpg", buf.tobytes(), "image/jpeg")})
+            if r.status_code != 200:
+                raise RuntimeError(f"Submit {r.status_code}: {r.text[:120]}")
+            job_id = r.json()["data"]["jobId"]
 
-        if not ocr_data:
-            result['error'] = 'OCR Data Empty (No text detected by PaddleOCR)'
-            return result
+            json_url, deadline = None, time.perf_counter() + API_TIMEOUT_S
+            while time.perf_counter() < deadline:
+                time.sleep(API_POLL_INTERVAL)
+                s = requests.get(f"{JOB_URL}/{job_id}", headers=headers, timeout=30)
+                if s.status_code != 200:
+                    raise RuntimeError(f"Poll {s.status_code}")
+                d = s.json()["data"]
+                if d["state"] == "done":
+                    json_url = d["resultUrl"]["jsonUrl"]
+                    break
+                if d["state"] == "failed":
+                    raise RuntimeError(f"Job failed: {d.get('errorMsg')}")
+            if json_url is None:
+                raise TimeoutError("API timeout")
 
-        # 7. Proses Fuzzy Matching
-        result['raw_text'], result['nutrients'] = process_fuzzy_matching(ocr_data)
+            jr = requests.get(json_url, timeout=60)
+            jr.raise_for_status()
+            return dict(ocr_data=parse_ocr_jsonl(jr.text), error=None,
+                        ms=(time.perf_counter() - t0) * 1000, attempts=attempt)
+        except Exception as e:
+            err = f"{type(e).__name__}: {e}"
+            time.sleep(2 * attempt)
 
-    except Exception as e:
-        result['error'] = f'Pipeline Error: {str(e)}'
-    finally:
-        if os.path.exists(temp_img_path): os.remove(temp_img_path)
+    return dict(ocr_data=[], error=err, ms=(time.perf_counter() - t0) * 1000, attempts=API_MAX_RETRIES)
 
-    return result
 
-# --- UI STREAMLIT ---
+# ============================================================ END-TO-END PIPELINE
+def run_pipeline(file_bytes, model, token):
+    res = dict(error=None, det_conf=None, bbox=None, vis=None, roi_raw=None,
+               raw_text="", ocr_items=[], nutrients={}, timing={}, attempts=0)
 
+    img = cv2.imdecode(np.frombuffer(file_bytes, np.uint8), cv2.IMREAD_COLOR)
+    if img is None:
+        res["error"] = "Failed to read/decode image."
+        return res
+
+    det, t_pre, t_det = detect_roi(img, model)
+    res["timing"].update({"Resize (detection input)": t_pre,
+                          "YOLOv11n Detection": t_det})
+    if det is None:
+        res["error"] = "Nutrition facts table not detected. Try retaking the photo with more even lighting."
+        return res
+
+    x1, y1, x2, y2 = det["bbox"]
+    if x2 - x1 < 5 or y2 - y1 < 5:
+        res["error"] = "ROI is too small to process."
+        return res
+
+    vis = img.copy()
+    cv2.rectangle(vis, (x1, y1), (x2, y2), (0, 255, 0), max(3, img.shape[1] // 300))
+    res.update(det_conf=det["conf"], bbox=det["bbox"], vis=vis)
+
+    t = time.perf_counter()
+    roi_raw = img[y1:y2, x1:x2].copy()
+    res["timing"]["Crop ROI"] = (time.perf_counter() - t) * 1000
+
+    t = time.perf_counter()
+    roi_ocr = preprocess_image(roi_raw) if PREPROCESS_ROI_BEFORE_OCR else roi_raw
+    res["timing"]["ROI Preprocessing"] = (time.perf_counter() - t) * 1000
+    res["roi_raw"] = roi_ocr
+
+    api = call_paddle_api(roi_ocr, token)
+    res["timing"]["PaddleOCR API (submit+polling+download)"] = api["ms"]
+    res["attempts"] = api["attempts"]
+    if api["error"]:
+        res["error"] = f"OCR failed: {api['error']}"
+        return res
+    if not api["ocr_data"]:
+        res["error"] = "PaddleOCR found no text in the ROI."
+        return res
+
+    res["ocr_items"] = api["ocr_data"]
+    lines = npp.group_lines(api["ocr_data"], LINE_TOL_MODE, LINE_TOL_FIXED_PX)
+    res["raw_text"] = "\n".join(" ".join(i["text"] for i in g) for g in lines)
+
+    t = time.perf_counter()
+    res["nutrients"] = npp.extract_nutrients(
+        api["ocr_data"], match_mode="fuzzy", numeric_mode="robust",
+        threshold=FUZZY_THRESHOLD, line_mode=LINE_TOL_MODE, fixed_tol=LINE_TOL_FIXED_PX)
+    res["timing"]["Regex + fuzzy matching"] = (time.perf_counter() - t) * 1000
+    return res
+
+
+# ============================================================ UI
 def main():
-    st.title("🥤 Beverage Nutrition Label Detection (YOLOv11 + PaddleOCR)")
-    st.markdown("""
-    This app detects nutrition facts tables on beverage packaging,
-    extracts text using OCR, and refines the extracted results using
-    **Fuzzy Matching** based on **BPOM** standards.
-    """)
+    st.title("🥤 Beverage Nutrition Label Detection")
+    st.caption("YOLOv11n → PaddleOCR → BPOM Dictionary Validation (BPOM Regulation No. 26 of 2021)")
 
-    # Load Model
-    with st.spinner("Loading the YOLOv11 model..."):
-        model = load_model()
-    
-    if model is None:
+    token = get_token()
+    if not token:
+        st.error("PaddleOCR token not set. Add `PADDLE_OCR_TOKEN` in Settings > Secrets "
+                 "(or as an environment variable).")
+        st.stop()
+    if not os.path.exists(MODEL_PATH):
+        st.error(f"Weight file `{MODEL_PATH}` not found in the application folder.")
         st.stop()
 
-    # --- BAGIAN INPUT GAMBAR / KAMERA ---
-    st.subheader("1. Upload Packaging Image")
-    
-    # Buat tab untuk memisahkan opsi Upload dan Kamera
-    tab_upload, tab_kamera = st.tabs(["📁 Upload Image", "📷 Take a Photo Right Away"])
+    with st.spinner("Loading YOLOv11n model..."):
+        model = load_model()
 
-    img_input = None
+    with st.sidebar:
+        st.header("Pipeline configuration")
+        st.write(f"- Detection confidence: **{DET_CONF}**")
+        st.write(f"- Fuzzy threshold (partial_ratio): **{FUZZY_THRESHOLD}**")
+        st.write(f"- Line grouping: **{LINE_TOL_MODE}** ({LINE_TOL_FIXED_PX} px)")
+        st.write(f"- OCR: **{MODEL_VERSION}** (API)")
+        st.info("Extraction results are automatic and may contain errors. Please verify the nutritional values "
+                "against the physical label, especially if you are on a special diet.")
 
-    with tab_upload:
-        uploaded_file = st.file_uploader("Upload an image from your device", type=["jpg", "jpeg", "png"])
-        if uploaded_file is not None:
-            img_input = uploaded_file
+    st.subheader("1. Insert packaging image")
+    tab_up, tab_cam = st.tabs(["📁 Upload image", "📷 Take a photo"])
+    file_bytes = None
+    with tab_up:
+        up = st.file_uploader("Upload image from device", type=["jpg", "jpeg", "png"])
+        if up is not None:
+            file_bytes = up.getvalue()
+    with tab_cam:
+        cam = st.camera_input("Position the nutrition facts table in the center of the screen")
+        if cam is not None:
+            file_bytes = cam.getvalue()
 
-    with tab_kamera:
-        camera_file = st.camera_input("Center the nutrition facts label on the screen, then click the camera button.")
-        if camera_file is not None:
-            img_input = camera_file
+    if file_bytes is None:
+        return
 
-    # --- PROSES JIKA ADA INPUT (DARI UPLOAD ATAU KAMERA) ---
-    if img_input is not None:
-        col1, col2 = st.columns([1, 1])
-        
-        with col1:
-            # PERBAIKAN: gunakan use_container_width, BUKAN use_column_width
-            st.image(img_input, caption="Input Image (Upload/Camera)", use_container_width=True)
-        
-        with col2:
-            with st.spinner("Detection and extraction in progress... Please wait."):
-                # Proses Pipeline
-                start_time = time.time()
-                result = run_pipeline_api_paddle(img_input, model)
-                elapsed_time = time.time() - start_time
-                
-                if result['error']:
-                    st.error(f"❌ An Error Occurred: {result['error']}")
-                else:
-                    st.success(f"✅ Successfully processed in {elapsed_time:.2f} second!")
-                    
-                    # Tampilkan ROI (Area yang dideteksi YOLO)
-                    if result['roi_img'] is not None:
-                        roi_rgb = cv2.cvtColor(result['roi_img'], cv2.COLOR_BGR2RGB)
-                        # Menampilkan Confidence Score
-                        st.markdown(f"#### 🎯 YOLOv11 Detection Confidence Score: **{result['det_conf']:.2%}**")
-                        
-                        # Tampilkan gambar ROI
-                        st.image(roi_rgb, caption="Nutritional Table Area (ROI)", use_container_width=True)
-                    
-                    # Tampilkan Hasil Raw OCR
-                    with st.expander("🔍 View Raw OCR Results (Before Fuzzy Processing)"):
-                        st.text_area("Raw Text", result['raw_text'], height=150)
-                    
-                    # Tampilkan Hasil Akhir (Setelah Fuzzy)
-                    st.subheader("📊 Nutritional Value Analysis Results (BPOM Validation)")
-                    
-                    if result['nutrients']:
-                        data_display = []
-                        for key, val in sorted(result['nutrients'].items()):
-                            display_name = key.replace('_', ' ').title()
-                            data_display.append({
-                                "Nutrisi": display_name,
-                                "Nilai": f"{val['value']} {val['unit']}",
-                                "Teks Asli": val['orig']
-                            })
-                        
-                        df_result = pd.DataFrame(data_display)
-                        st.table(df_result)
-                    else:
-                        st.warning("No valid nutrients were detected after the Fuzzy Matching process.")
+    with st.spinner("Processing detection, OCR, and BPOM validation..."):
+        t0 = time.perf_counter()
+        res = run_pipeline(file_bytes, model, token)
+        total_s = time.perf_counter() - t0
+
+    col1, col2 = st.columns(2)
+    with col1:
+        if res["vis"] is not None:
+            st.image(cv2.cvtColor(res["vis"], cv2.COLOR_BGR2RGB),
+                     caption=f"YOLOv11n detection result (confidence {res['det_conf']:.2f})",
+                     use_container_width=True)
+        else:
+            st.image(file_bytes, caption="Input image", use_container_width=True)
+
+    with col2:
+        if res["error"]:
+            st.error(f"❌ {res['error']}")
+            return
+
+        st.success(f"✅ Completed in {total_s:.2f} seconds")
+        if res["attempts"] > 1:
+            st.warning(f"Request to OCR API was retried {res['attempts'] - 1} times.")
+        st.image(cv2.cvtColor(res["roi_raw"], cv2.COLOR_BGR2RGB),
+                 caption="Nutrition table ROI (OCR input)", use_container_width=True)
+
+    st.subheader("2. Nutritional value extraction results (7 mandatory BPOM categories)")
+    rows = []
+    for cat in npp.REQUIRED_CATEGORIES:
+        v = res["nutrients"].get(cat)
+        if v:
+            rows.append({
+                "Nutrition": DISPLAY_NAMES[cat],
+                "Value": f"{v['value']:g} {v['unit']}",
+                "Status": "⚠️ Ambiguous match" if v.get("ambiguous") else "✅ Detected",
+                "Match score": f"{v['score']:.0f}",
+                "Original text (OCR line)": v["orig"],
+            })
+        else:
+            rows.append({"Nutrition": DISPLAY_NAMES[cat], "Value": "-", "Status": "❌ Not detected",
+                         "Match score": "-", "Original text (OCR line)": "-"})
+    df = pd.DataFrame(rows)
+    st.dataframe(df, use_container_width=True, hide_index=True)
+
+    n_det = sum(1 for c in npp.REQUIRED_CATEGORIES if c in res["nutrients"])
+    n_amb = sum(1 for v in res["nutrients"].values() if v.get("ambiguous"))
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Detected categories", f"{n_det} / {len(npp.REQUIRED_CATEGORIES)}")
+    m2.metric("Ambiguous matches", n_amb)
+    m3.metric("Total time", f"{total_s:.2f} s")
+    if n_det < len(npp.REQUIRED_CATEGORIES):
+        st.info("Some categories were not readable. Try retaking the photo with even lighting, "
+                "no glare, and the label in a straight position.")
+
+    with st.expander("🔍 Raw OCR text per line (before BPOM validation)"):
+        st.text_area("Raw OCR", res["raw_text"], height=180)
+
+    with st.expander("⏱️ Time breakdown per stage"):
+        tdf = pd.DataFrame({"Stage": list(res["timing"]),
+                            "Time (ms)": [round(v, 2) for v in res["timing"].values()]})
+        st.dataframe(tdf, use_container_width=True, hide_index=True)
+        st.caption("OCR time depends on internet connection and PaddleOCR API server load.")
+
+    st.download_button("⬇️ Download results (CSV)", df.to_csv(index=False).encode("utf-8"),
+                       file_name="nutrition_extraction_results.csv", mime="text/csv")
+
 
 if __name__ == "__main__":
     main()
